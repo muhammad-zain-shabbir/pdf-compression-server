@@ -1,0 +1,12 @@
+[service]
+# Tell Railway this is a web service
+type = "web"
+
+# Tell Railway which port to expose
+port = 8080
+
+# Health check path
+healthcheckPath = "/"
+
+# Health check timeout
+healthcheckTimeout = 30
