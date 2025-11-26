@@ -1,256 +1,228 @@
 const express = require('express');
 const multer = require('multer');
-const fs = require('fs');
-const path = require('path');
-const { exec } = require('child_process');
 const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const { exec } = require('child_process');
+const util = require('util');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
+// Allow requests from any origin for testing
+app.use(cors({
+    origin: '*',
+    credentials: true
+}));
+
 app.use(express.json());
-app.use(express.static('public'));
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        const uploadDir = 'uploads/';
-        if (!fs.existsSync(uploadDir)) {
-            fs.mkdirSync(uploadDir, { recursive: true });
-        }
-        cb(null, uploadDir);
-    },
-    filename: (req, file, cb) => {
-        const uniqueName = Date.now() + '-' + Math.round(Math.random() * 1E9) + '.pdf';
-        cb(null, uniqueName);
-    }
-});
-
-const upload = multer({
-    storage: storage,
+// Setup file uploads
+const upload = multer({ 
+    dest: 'uploads/',
     limits: {
-        fileSize: 100 * 1024 * 1024 // 100MB limit
+        fileSize: 50 * 1024 * 1024 // 50MB limit
     },
     fileFilter: (req, file, cb) => {
+        // Check if file is a PDF
         if (file.mimetype === 'application/pdf') {
             cb(null, true);
         } else {
-            cb(new Error('Only PDF files are allowed!'), false);
+            cb(new Error('Only PDF files are allowed'), false);
         }
     }
 });
 
-// Utility functions
-function formatFileSize(bytes) {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+// Create uploads folder if it doesn't exist
+if (!fs.existsSync('uploads')) {
+    fs.mkdirSync('uploads');
 }
 
-function cleanupFile(filePath) {
-    setTimeout(() => {
-        if (fs.existsSync(filePath)) {
-            fs.unlink(filePath, (err) => {
-                if (err) console.error('Cleanup error:', err);
-            });
-        }
-    }, 300000); // Clean up after 5 minutes
-}
+// Promisify exec for better async handling
+const execAsync = util.promisify(exec);
 
-// Enhanced Ghostscript compression with multiple levels
-function compressWithGhostscript(inputPath, outputPath, compressionLevel = 'high') {
-    return new Promise((resolve, reject) => {
-        const settings = {
-            'low': '/printer',      // Light compression
-            'medium': '/prepress',  // Medium compression  
-            'high': '/ebook',       // High compression (default)
-            'extreme': '/screen'    // Maximum compression
-        };
+// PDF Compression endpoint
+app.post('/compress-pdf', upload.single('pdfFile'), async (req, res) => {
+    let inputPath = null;
+    let outputPath = null;
 
-        const command = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=${settings[compressionLevel]} -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${outputPath}" "${inputPath}"`;
-        
-        console.log(`Executing: ${command}`);
-        
-        exec(command, (error, stdout, stderr) => {
-            if (error) {
-                console.error('Ghostscript error:', error);
-                reject(error);
-                return;
-            }
-            
-            // Check if output file was created and has reasonable size
-            if (fs.existsSync(outputPath)) {
-                const stats = fs.statSync(outputPath);
-                if (stats.size > 0) {
-                    resolve();
-                } else {
-                    reject(new Error('Output file is empty'));
-                }
-            } else {
-                reject(new Error('Output file was not created'));
-            }
-        });
-    });
-}
-
-// Advanced compression with multiple passes
-async function advancedCompress(inputPath, outputPath) {
-    const tempDir = 'temp/';
-    if (!fs.existsSync(tempDir)) {
-        fs.mkdirSync(tempDir, { recursive: true });
-    }
-
-    let bestSize = fs.statSync(inputPath).size;
-    let bestPath = inputPath;
-
-    // Try different compression levels
-    const levels = ['extreme', 'high', 'medium'];
-    
-    for (const level of levels) {
-        try {
-            const tempOutput = path.join(tempDir, `compressed-${level}-${Date.now()}.pdf`);
-            await compressWithGhostscript(inputPath, tempOutput, level);
-            
-            const newSize = fs.statSync(tempOutput).size;
-            console.log(`Level ${level}: ${formatFileSize(newSize)}`);
-            
-            // If this is better than our current best, use it
-            if (newSize < bestSize && newSize > 0) {
-                if (bestPath !== inputPath) {
-                    // Remove previous best if it's not the original
-                    fs.unlinkSync(bestPath);
-                }
-                bestSize = newSize;
-                bestPath = tempOutput;
-            } else {
-                // Remove this temp file if it's not the best
-                fs.unlinkSync(tempOutput);
-            }
-        } catch (error) {
-            console.log(`Compression level ${level} failed:`, error.message);
-            continue; // Try next level
-        }
-    }
-
-    // If we found a better compression, copy to final output
-    if (bestPath !== inputPath) {
-        fs.copyFileSync(bestPath, outputPath);
-        
-        // Cleanup temp files
-        if (fs.existsSync(bestPath)) {
-            fs.unlinkSync(bestPath);
-        }
-        
-        // Cleanup temp directory
-        if (fs.existsSync(tempDir)) {
-            fs.rmSync(tempDir, { recursive: true, force: true });
-        }
-    } else {
-        // Fallback to high compression
-        await compressWithGhostscript(inputPath, outputPath, 'high');
-    }
-}
-
-// Routes
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// Enhanced compress endpoint
-app.post('/compress', upload.single('file'), async (req, res) => {
     try {
+        console.log('📥 Received PDF compression request');
+        
         if (!req.file) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'No file uploaded' 
-            });
+            return res.status(400).json({ error: 'No file uploaded' });
         }
 
-        const inputPath = req.file.path;
-        const originalSize = fs.statSync(inputPath).size;
-        const outputFilename = 'compressed-' + req.file.filename;
-        const outputPath = path.join('uploads', outputFilename);
+        inputPath = req.file.path;
+        const originalName = req.file.originalname;
+        const compressedName = `compressed_${path.parse(originalName).name}.pdf`;
+        outputPath = path.join('uploads', `compressed_${Date.now()}.pdf`);
 
-        console.log(`Compressing: ${req.file.originalname}, Size: ${formatFileSize(originalSize)}`);
+        console.log(`📄 Processing: ${originalName} (${req.file.size} bytes)`);
+        console.log(`🔧 Input: ${inputPath}, Output: ${outputPath}`);
 
-        // Ensure output directory exists
-        if (!fs.existsSync('uploads')) {
-            fs.mkdirSync('uploads', { recursive: true });
+        // Ghostscript compression command
+        // Using /ebook for medium quality, good compression
+        const gsCommand = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${outputPath}" "${inputPath}"`;
+
+        console.log(`⚡ Running Ghostscript command: ${gsCommand}`);
+
+        // Execute Ghostscript compression
+        const { stdout, stderr } = await execAsync(gsCommand);
+        
+        if (stderr) {
+            console.warn('Ghostscript warnings:', stderr);
         }
 
-        // Use advanced compression
-        await advancedCompress(inputPath, outputPath);
+        // Check if output file was created
+        if (!fs.existsSync(outputPath)) {
+            throw new Error('Ghostscript failed to create compressed file');
+        }
 
-        const compressedSize = fs.statSync(outputPath).size;
-        const reduction = ((originalSize - compressedSize) / originalSize) * 100;
+        const stats = fs.statSync(outputPath);
+        console.log(`✅ Compression complete: ${req.file.size} bytes → ${stats.size} bytes`);
+        console.log(`📊 Compression ratio: ${((1 - stats.size / req.file.size) * 100).toFixed(2)}%`);
 
-        console.log(`Compression successful: ${formatFileSize(originalSize)} → ${formatFileSize(compressedSize)} (${reduction.toFixed(1)}% reduction)`);
-
-        res.json({
-            success: true,
-            originalSize: formatFileSize(originalSize),
-            compressedSize: formatFileSize(compressedSize),
-            reductionPercent: reduction.toFixed(1),
-            downloadUrl: `/download/${outputFilename}`,
-            originalName: req.file.originalname
+        // Send the compressed file
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="${compressedName}"`);
+        res.setHeader('X-Original-Size', req.file.size);
+        res.setHeader('X-Compressed-Size', stats.size);
+        res.setHeader('X-Compression-Ratio', ((1 - stats.size / req.file.size) * 100).toFixed(2));
+        
+        const fileStream = fs.createReadStream(outputPath);
+        fileStream.pipe(res);
+        
+        // Clean up after sending
+        fileStream.on('end', () => {
+            cleanupFiles(inputPath, outputPath);
+            console.log('✅ File sent and cleaned up');
         });
 
-        // Schedule cleanup
-        cleanupFile(inputPath);
-        cleanupFile(outputPath);
+        fileStream.on('error', (error) => {
+            console.error('Stream error:', error);
+            cleanupFiles(inputPath, outputPath);
+            res.status(500).json({ error: 'File streaming failed' });
+        });
 
     } catch (error) {
-        console.error('Compression error:', error);
+        console.error('❌ Compression error:', error);
+        cleanupFiles(inputPath, outputPath);
         
-        // Cleanup on error
-        if (req.file && fs.existsSync(req.file.path)) {
-            fs.unlinkSync(req.file.path);
+        if (error.code === 'ENOENT') {
+            res.status(500).json({ error: 'Ghostscript not found. Please ensure it is installed on the server.' });
+        } else if (error.stderr && error.stderr.includes('Error')) {
+            res.status(500).json({ error: 'Ghostscript processing failed: ' + error.stderr });
+        } else {
+            res.status(500).json({ error: 'Compression failed: ' + error.message });
         }
+    }
+});
+
+// Helper function to clean up temporary files
+function cleanupFiles(inputPath, outputPath) {
+    try {
+        if (inputPath && fs.existsSync(inputPath)) {
+            fs.unlinkSync(inputPath);
+        }
+        if (outputPath && fs.existsSync(outputPath)) {
+            fs.unlinkSync(outputPath);
+        }
+    } catch (error) {
+        console.error('Error cleaning up files:', error);
+    }
+}
+
+// Alternative compression endpoint with quality option
+app.post('/compress-pdf-advanced', upload.single('pdfFile'), async (req, res) => {
+    try {
+        const { quality = 'medium' } = req.body; // low, medium, high
         
-        res.status(500).json({ 
-            success: false, 
-            error: 'Compression failed. Please try another file or ensure Ghostscript is installed.' 
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
+
+        const qualitySettings = {
+            low: '/screen',    // Low quality, high compression
+            medium: '/ebook',  // Medium quality, good compression
+            high: '/printer'   // High quality, less compression
+        };
+
+        const pdfSettings = qualitySettings[quality] || '/ebook';
+
+        const inputPath = req.file.path;
+        const originalName = req.file.originalname;
+        const compressedName = `compressed_${path.parse(originalName).name}.pdf`;
+        const outputPath = path.join('uploads', `compressed_${Date.now()}.pdf`);
+
+        console.log(`🔧 Using quality setting: ${quality} (${pdfSettings})`);
+
+        const gsCommand = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=${pdfSettings} -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${outputPath}" "${inputPath}"`;
+
+        await execAsync(gsCommand);
+
+        if (!fs.existsSync(outputPath)) {
+            throw new Error('Compression failed');
+        }
+
+        const stats = fs.statSync(outputPath);
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="${compressedName}"`);
+        
+        const fileStream = fs.createReadStream(outputPath);
+        fileStream.pipe(res);
+        
+        fileStream.on('end', () => {
+            cleanupFiles(inputPath, outputPath);
+        });
+
+    } catch (error) {
+        console.error('Advanced compression error:', error);
+        res.status(500).json({ error: 'Compression failed: ' + error.message });
+    }
+});
+
+// Health check - test if server is working
+app.get('/', (req, res) => {
+    res.json({ 
+        message: '🚀 PDF Compression Server is running!',
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        features: ['Ghostscript PDF Compression', 'CORS Enabled', 'File Upload']
+    });
+});
+
+// Test endpoint with Ghostscript check
+app.get('/test', async (req, res) => {
+    try {
+        // Test if Ghostscript is available
+        const { stdout } = await execAsync('gs --version');
+        const gsVersion = stdout.trim();
+        
+        res.json({ 
+            success: true,
+            message: 'Server is working perfectly!',
+            server: 'Node.js PDF Compression',
+            ghostscript: {
+                available: true,
+                version: gsVersion
+            },
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        res.json({ 
+            success: false,
+            message: 'Server is running but Ghostscript is not available',
+            error: error.message,
+            timestamp: new Date().toISOString()
         });
     }
 });
 
-// Download endpoint
-app.get('/download/:filename', (req, res) => {
-    const filename = req.params.filename;
-    const filePath = path.join('uploads', filename);
-    
-    if (!fs.existsSync(filePath)) {
-        return res.status(404).json({ error: 'File not found' });
-    }
-
-    const originalName = filename.replace('compressed-', '').replace(/^\d+-(\d+-)?/, '');
-    
-    res.download(filePath, `compressed-${originalName}`, (err) => {
-        if (err) {
-            console.error('Download error:', err);
-        }
-        // File will be cleaned up by the scheduled cleanup
-    });
-});
-
-// Health check
-app.get('/health', (req, res) => {
-    res.json({ 
-        status: 'OK', 
-        timestamp: new Date().toISOString(),
-        service: 'PDF Compression Server'
-    });
-});
-
-// Start server
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`🚀 PDF Compression Server running on port ${PORT}`);
-    console.log(`📊 Access: http://localhost:${PORT}`);
-    console.log(`✅ Ready to compress PDF files!`);
+    console.log(`🎉 Server running on port ${PORT}`);
+    console.log(`🌐 Health check: http://localhost:${PORT}/`);
+    console.log(`🔧 Ghostscript compression enabled`);
+    console.log(`🔄 Ready for real PDF compression!`);
 });
-
-module.exports = app;
